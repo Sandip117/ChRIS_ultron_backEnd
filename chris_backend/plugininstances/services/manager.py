@@ -51,12 +51,15 @@ from django.utils import timezone
 from django.conf import settings
 
 import pfurl
+import time
+import json
 
 from core.swiftmanager import SwiftManager, ClientException
 
 if settings.DEBUG:
     import pdb
     import pudb
+    import rpudb
     from celery.contrib import rdb
 
 
@@ -70,8 +73,8 @@ class PluginInstanceManager(object):
         self.c_plugin_inst = plugin_instance
 
         # hardcode mounting points for the input and outputdir in the app's container!
-        self.str_app_container_inputdir = '/share/incoming'
-        self.str_app_container_outputdir = '/share/outgoing'
+        self.str_app_container_inputdir     = '/share/incoming'
+        self.str_app_container_outputdir    = '/share/outgoing'
 
         # some schedulers require a minimum job ID string length
         self.str_job_id = 'chris-jid-' + str(plugin_instance.id)
@@ -87,7 +90,7 @@ class PluginInstanceManager(object):
         Run a plugin instance's app via a call to a remote service provider.
         """
         if self.c_plugin_inst.status == 'cancelled':
-            return
+            return self.c_plugin_inst.status
 
         plugin = self.c_plugin_inst.plugin
         app_args = []
@@ -254,8 +257,8 @@ class PluginInstanceManager(object):
                         logger.error('Swift storage error, detail: %s' % str(e))
                     else:
                         nobjects += 1
-        swiftState = {'d_swiftstore': {'filesPushed': nobjects}}
-        self.c_plugin_inst.register_output_files(swiftState=swiftState)
+        #swiftState = {'d_swiftstore': {'filesPushed': nobjects}}
+        #self.c_plugin_inst.register_output_files(swiftState=swiftState)
 
     def check_plugin_instance_app_exec_status(self):
         """
@@ -263,44 +266,53 @@ class PluginInstanceManager(object):
         service to determine job status and if just finished without error,
         register output files.
         """
+
         if self.c_plugin_inst.status == 'cancelled':
             return self.c_plugin_inst.status
 
-        d_msg = {
-            "action": "status",
-            "meta": {
-                    "remote": {
-                        "key": self.str_job_id
-                    }
+        if self.c_plugin_inst.status == 'started':
+            d_msg = {
+                "action": "status",
+                "meta": {
+                        "remote": {
+                            "key": self.str_job_id
+                        }
+                }
             }
-        }
-        d_response = self.call_app_service(d_msg)
-        l_status = d_response['jobOperationSummary']['compute']['return']['l_status']
-        logger.info('Current job remote status = %s', l_status)
-        str_DBstatus = self.c_plugin_inst.status
-        logger.info('Current job DB status = %s', str_DBstatus)
+            d_response = self.call_app_service(d_msg)
+            l_status = d_response['jobOperationSummary']['compute']['return']['l_status']
+            logger.info('Current job remote status = %s', l_status)
+            logger.info('Current job DB status     = %s', self.c_plugin_inst.status)
 
-        str_responseStatus = self.serialize_app_response_status(d_response)
-        if str_DBstatus == 'started' and 'swiftPut:True' in str_responseStatus:
-            # register output files
-            d_swiftState = d_response['jobOperation']['info']['swiftPut']
-            self.c_plugin_inst.register_output_files(swiftState=d_swiftState)
-
-            if 'finishedSuccessfully' in l_status:
-                self.c_plugin_inst.status = 'finishedSuccessfully'
+            str_responseStatus = self.serialize_app_response_status(d_response)
+            if 'swiftPut:True' in str_responseStatus:
+                logger.info("Registering swift objects to CUBE")
+                d_swiftState = d_response['jobOperation']['info']['swiftPut']
+                logger.info("swiftState = %s" % json.dumps(d_swiftState, indent = 4))
+                # This setting of status protects against unnecessary concurrent
+                # collisions on `register_output_files()` and better informs the FE
+                self.c_plugin_inst.status = 'registeringFiles'
+                self.c_plugin_inst.save()
+                d = self.c_plugin_inst.register_output_files(swiftState=d_swiftState)
+                # Once the `register_output_files` is done, we can set
+                # the proper finall state
+                if d['status']:
+                    self.c_plugin_inst.status = 'finishedSuccessfully'
+                else:
+                    self.c_plugin_inst.status = 'finishedWithError'
                 logger.info("Saving job DB status as '%s'", self.c_plugin_inst.status)
                 self.c_plugin_inst.end_date = timezone.now()
                 logger.info("Saving job DB end_date as '%s'", self.c_plugin_inst.end_date)
                 self.c_plugin_inst.save()
 
-        # Some possible error handling...
-        if 'finishedWithError' in l_status:
-            self.c_plugin_inst.status = 'finishedWithError'
-            logger.info("Saving job DB status as '%s'", self.c_plugin_inst.status)
-            self.c_plugin_inst.end_date = timezone.now()
-            logger.info("Saving job DB end_date as '%s'", self.c_plugin_inst.end_date)
-            self.c_plugin_inst.save()
-            self.handle_app_remote_error()
+            # Some possible error handling...
+            if 'finishedWithError' in l_status:
+                self.c_plugin_inst.status = 'finishedWithError'
+                logger.info("Saving job DB status as '%s'", self.c_plugin_inst.status)
+                self.c_plugin_inst.end_date = timezone.now()
+                logger.info("Saving job DB end_date as '%s'", self.c_plugin_inst.end_date)
+                self.c_plugin_inst.save()
+                self.handle_app_remote_error()
         return self.c_plugin_inst.status
 
     def cancel_plugin_instance_app_exec(self):
@@ -328,7 +340,20 @@ class PluginInstanceManager(object):
         logger.info('comms sent to pfcon service at -->%s<--', remote_url)
         logger.info('message sent: %s', json.dumps(d_msg, indent=4))
 
-        # speak to the service...
+        # Leave here for now... might be useful for later debugging.
+        # with open('/tmp/%d-%s-%s.json' % \
+        #          (time.time_ns() // 1000000,
+        #           d_msg['action'],
+        #           self.str_job_id), 'w') as l:
+        #          json.dump(d_msg, l, indent = 4)
+
+        # logger.debug('comms sent to pfcon service at -->%s<--', remote_url)
+        # logger.debug('message sent: %s', json.dumps(d_msg, indent=4))
+
+        # try:
+        #     rpudb.set_trace(addr='0.0.0.0', port=7901)
+        # except:
+        #     pudb.set_trace()
         d_response = json.loads(serviceCall())
 
         if isinstance(d_response, dict):
@@ -343,24 +368,27 @@ class PluginInstanceManager(object):
 
     def manage_app_service_fsplugin_empty_inputdir(self):
         """
-        This method is responsible for managing the 'inputdir' in the case of FS plugins.
+        This method is responsible for managing the 'inputdir' in the case of
+        FS plugins.
 
-        An FS plugin does not have an inputdir spec, since this is only a requirement
-        for DS plugins. Nonetheless, the underlying management system (pfcon/pfurl) does
-        require some non-zero inputdir spec in order to operate correctly.
+        An FS plugin does not have an inputdir spec, since this is only a
+        requirement for DS plugins. Nonetheless, the underlying management
+        system (pfcon/pfurl) does require some non-zero inputdir spec in order
+        to operate correctly.
 
         The hack here is to store data somewhere in swift and accessing it as a
-        "pseudo" inputdir for FS plugins. For example, if an FS plugin has no arguments
-        of type 'path', then we create a "dummy" inputdir with a small dummy text file
-        in swift storage. This is then transmitted as an 'inputdir' to the compute
-        environment, and can be completely ignored by the plugin.
+        "pseudo" inputdir for FS plugins. For example, if an FS plugin has no
+        arguments of type 'path', then we create a "dummy" inputdir with a
+        small dummy text file in swift storage. This is then transmitted as an
+        'inputdir' to the compute environment, and can be completely ignored by
+        the plugin.
 
         Importantly, one major exception to the normal FS processing scheme
         exists: an FS plugin that collects data from object storage. This
         storage location is not an 'inputdir' in the traditional sense, and is
         thus specified in the FS plugin argument list as argument of type
         'path' (i.e. there is no positional argument for inputdir as in DS
-        plugins. Thus, if a type 'path' argument is specified, this 'path'
+        plugins). Thus, if a type 'path' argument is specified, this 'path'
         is assumed to denote a location in object storage.
         """
         str_inputdir = os.path.join(self.data_dir, 'squashEmptyDir').lstrip('/')
@@ -379,25 +407,25 @@ class PluginInstanceManager(object):
         """
         Serialize and save the 'jobOperation' and 'jobOperationSummary'.
         """
-        str_summary = json.dumps(d_response['jobOperationSummary'])
-        #logger.debug("str_summary = '%s'", str_summary)
-        str_raw = self.json_zipToStr(d_response['jobOperation'])
-
         # Still WIP about what is best summary...
-        # a couple of options / ideas linger
+
         try:
-            str_containerLogs = d_response['jobOperation'] \
-                ['info'] \
+            str_logsFromCompute = d_response['jobOperationSummary'] \
                 ['compute'] \
                 ['return'] \
-                ['d_ret'] \
                 ['l_logs'][0]
-        except:
-            str_containerLogs = "Container logs not currently available."
+
+            if len(str_logsFromCompute) > 3000:
+                d_response['jobOperationSummary'] \
+                    ['compute'] \
+                    ['return'] \
+                    ['l_logs'][0] = str_logsFromCompute[-3000:]
+        except Exception:
+            logger.info('Compute logs not currently available.')
 
         # update plugin instance with status info
-        self.c_plugin_inst.summary = str_summary
-        self.c_plugin_inst.raw = str_raw
+        self.c_plugin_inst.summary = json.dumps(d_response['jobOperationSummary'])
+        self.c_plugin_inst.raw = self.json_zipToStr(d_response['jobOperation'])
         self.c_plugin_inst.save()
 
         str_responseStatus = ""
