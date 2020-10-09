@@ -540,6 +540,9 @@ else
                          "pl-z2labelmap"
                          "pl-mri10yr06mo01da_normal"
                          "pl-mgz_converter"
+                         "pl-fshack"
+                         "pl-fastsurfer_inference"
+                         "pl-mgz2lut_report"
     )
 
     title -d 1 "Checking on container plugins and pulling latest versions where needed..."
@@ -668,6 +671,9 @@ else
                          "pl-mri10yr06mo01da_normal"
                          "pl-mri10yr06mo01da_normal^moc"
                          "pl-mgz_converter"
+                         "pl-fshack"
+                         "pl-fastsurfer_inference"
+                         "pl-mgz2lut_report"
     )
 
     title -d 1 "Automatically registering some plugins from the ChRIS store into CUBE..."
